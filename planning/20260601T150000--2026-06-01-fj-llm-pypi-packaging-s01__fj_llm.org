@@ -1,0 +1,151 @@
+#+title: 2026-06-01 fj_llm PyPI Packaging s01
+#+date: 2026-06-01
+#+filetags: :fj_llm:
+
+* Overview
+
+Make =fj_llm= a proper, versioned, publicly-installable PyPI package. Two
+consumers drive this: Enlightapp (company project, Firebase Functions on Cloud
+Run) and a personal LLM pipeline. Both will pin to a released version via
+=requirements.txt=. PyPI was chosen over GitHub-based pip install so that
+Enlightapp's CI/CD needs no GitHub credentials, and any future Enlightapp
+engineer can install it without setup.
+
+* Decision Log
+
+- Distribution target :: PyPI (not GitHub-based pip install, not vendoring)
+- Reason :: Two independent consumers; one is a company project that must not
+  depend on personal GitHub credentials in CI. =pip install fj_llm==X.Y.Z=
+  works anywhere.
+- Starting version :: =0.2.0= (=0.1.0= was cut from an older, simpler client;
+  this release brings meaningful additions: fallback support, quota detection,
+  Google provider, cost logging, stdlib logging)
+
+* Current State of ~/fj/fj_llm
+
+The directory already exists with a working skeleton:
+- =fj_llm/client.py= — older version, missing several improvements from
+  jupeserver's copy (see sync section below)
+- =fj_llm/__init__.py= — exports =LLMClient=, =LLMResponse=; version =0.1.0=
+- =setup.py= — legacy packaging; will be replaced by =pyproject.toml=
+- =fj_llm.egg-info/= — artifact from a prior =pip install -e .=; will be
+  regenerated
+- =test/test_all_llms.py= — manual integration script, not pytest
+- =backup/=, =fj-crypt/=, =src/= — unrelated files; leave in place
+
+* File Structure After This Work
+
+#+begin_src
+~/fj/fj_llm/
+├── pyproject.toml              # replaces setup.py
+├── README.md                   # required for a useful PyPI page
+├── .github/
+│   └── workflows/
+│       └── publish.yml         # publish to PyPI on git tag push
+├── fj_llm/
+│   ├── __init__.py             # version bumped to 0.2.0
+│   └── client.py               # synced (see below)
+├── tests/
+│   ├── __init__.py
+│   └── test_client.py          # unit tests with mocked HTTP (no real API calls)
+└── planning/
+    └── (this file)
+#+end_src
+
+=setup.py= is deleted once =pyproject.toml= is working.
+=test/= is renamed to =tests/=.
+
+* Phases
+
+** Phase 1 — Packaging [0/4]
+GOAL: =pip install fj_llm= from PyPI works, with a publish-on-tag GitHub Action.
+
+- [ ] 1. Write =pyproject.toml= (project metadata, dependencies, entry point,
+         pytest config)
+- [ ] 2. Write =README.md= (install, quickstart config example, provider table)
+- [ ] 3. Write =.github/workflows/publish.yml= (trigger: push tag =v*=; steps:
+         build, twine upload to PyPI)
+- [ ] 4. Delete =setup.py=; verify =pip install -e .= still works from
+         =pyproject.toml=
+
+** Phase 2 — Client Code Sync [0/5]
+GOAL: =fj_llm/client.py= matches jupeserver's improvements, with the jupeserver
+logger replaced by stdlib =logging=.
+
+Changes to bring in from jupeserver's =fj_llm/client.py=:
+
+- [ ] 1. Add =QuotaExceededError= exception class
+- [ ] 2. Refactor =query()= into =query()= (timing + stdlib logging) +
+         =_do_query()= (implementation); add fallback model support
+         (=model_config.get('fallback')=, =_is_fallback= param)
+- [ ] 3. Add =_append_cost_log()= — writes JSONL to a configurable path
+         (default: =~/.local/share/fj_llm/costs.jsonl=, not hardcoded to
+         jupeserver's =auto/= dir); disable silently if path is unwritable
+- [ ] 4. Add =_query_google()= (Gemini provider)
+- [ ] 5. Sync =_query_openai()= — add =max_completion_tokens= fix and quota
+         detection; sync =_query_anthropic()= — add quota detection
+
+Logging replacement:
+- Remove =from services.logger import get_logger= (jupeserver-specific)
+- Replace all =_logger._write(...)= calls with stdlib =logging.getLogger("fj_llm")=
+  calls at the appropriate level (INFO / WARNING / ERROR)
+- The cost JSONL log is kept as the persistent record; the logger is for
+  runtime stdout visibility only
+
+** Phase 3 — Tests [0/2]
+GOAL: Proper pytest suite; no real API calls required to run.
+
+- [ ] 1. Write =tests/test_client.py= — unit tests using =unittest.mock= to
+         patch =requests.Session.post=; cover: config loading, successful
+         query, retry on failure, quota fallback, cost calculation, all four
+         providers
+- [ ] 2. Rename/delete old =test/test_all_llms.py= (manual integration script
+         — keep as =tests/integration_test_all_llms.py= with a note that it
+         requires real API keys)
+
+** Phase 4 — GitHub Repo + First PyPI Release [0/4]
+GOAL: Package live on PyPI at =0.2.0=.
+
+- [ ] 1. Create personal GitHub repo =fj_llm= (public); push current state
+- [ ] 2. Create PyPI account (if not already); generate API token; add as
+         =PYPI_API_TOKEN= GitHub secret
+- [ ] 3. Tag =v0.2.0= and push — confirm GitHub Action publishes to PyPI
+- [ ] 4. =pip install fj_llm==0.2.0= in a clean venv to verify
+
+* Dependency Notes
+
+=fj_llm= itself only needs:
+- =requests>=2.25.0=
+- =pyyaml>=5.4.0=
+
+No provider SDK is required — all providers are called via raw HTTP. This is
+intentional: keeps the package lightweight and avoids pinning to any provider's
+SDK release cycle.
+
+Test-only dependencies (not shipped):
+- =pytest=
+- (no mock library needed — =unittest.mock= is stdlib)
+
+* Cost Log Path Design
+
+The jupeserver version hardcodes =Path(__file__).parent.parent / 'auto' / 'llm_costs.jsonl'=,
+which only works inside the jupeserver repo layout. The standalone version will:
+- Default to =~/.local/share/fj_llm/costs.jsonl=
+- Allow override via a =cost_log= key in the config file or =FJ_LLM_COST_LOG=
+  env var
+- Silently skip logging if the path is not writable (same "never crash the
+  caller" contract as the current code)
+
+* Consumers — Update Checklist (after Phase 4)
+
+Once =fj_llm 0.2.0= is on PyPI, update both downstream consumers:
+
+- Enlightapp ea-service :: replace vendored =fj_llm/client.py= copy with
+  =fj_llm==0.2.0= in =requirements.txt=
+- Personal LLM pipeline :: same; update any usage of deprecated call patterns
+
+* Next Session Plan
+
+Start Phase 1: write =pyproject.toml=, =README.md=, and the publish GitHub
+Action. Then move to Phase 2 (client sync). Tests and GitHub repo setup can
+follow in a second session if needed.
