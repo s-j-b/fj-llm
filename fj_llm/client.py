@@ -10,7 +10,7 @@ import os
 import time
 import yaml
 import requests
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +36,7 @@ class LLMResponse:
     cost: Optional[float] = None
     success: bool = True
     error: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 
 class LLMClient:
@@ -165,30 +166,21 @@ class LLMClient:
         except Exception:
             pass  # never crash the caller over logging
 
-    def _do_query(self, model_alias: str, prompt: str, context: Optional[str] = None, _is_fallback: bool = False) -> LLMResponse:
-        if model_alias not in self.config["models"]:
-            return LLMResponse(content="", model=model_alias, success=False, error=f"Unknown model alias: {model_alias}")
-
+    def _run_with_retries(
+        self,
+        model_alias: str,
+        attempt_fn: Callable[[], LLMResponse],
+        _is_fallback: bool,
+        on_fallback: Callable[[str], LLMResponse],
+    ) -> LLMResponse:
+        """Shared retry/fallback loop for query() and query_chat(). attempt_fn() runs one
+        provider call and may raise QuotaExceededError (triggers fallback) or any other
+        Exception (triggers retry)."""
         model_config = self.config["models"][model_alias]
-
-        full_prompt = prompt
-        if context:
-            full_prompt = f"Context:\n{context}\n\nTask:\n{prompt}"
 
         for attempt in range(self.config["defaults"]["retry_attempts"]):
             try:
-                provider = model_config["provider"]
-                if provider == "deepseek":
-                    response = self._query_deepseek(model_config, full_prompt)
-                elif provider == "anthropic":
-                    response = self._query_anthropic(model_config, full_prompt)
-                elif provider == "openai":
-                    response = self._query_openai(model_config, full_prompt)
-                elif provider in ("google", "gemini"):
-                    response = self._query_google(model_config, full_prompt)
-                else:
-                    return LLMResponse(content="", model=model_alias, success=False, error=f"Unsupported provider: {provider}")
-
+                response = attempt_fn()
                 if response.success:
                     return response
 
@@ -196,7 +188,7 @@ class LLMClient:
                 fallback = model_config.get("fallback")
                 if fallback and not _is_fallback:
                     _logger.warning("llm/%s quota exceeded, falling back to %s", model_alias, fallback)
-                    return self._do_query(fallback, prompt, context, _is_fallback=True)
+                    return on_fallback(fallback)
                 return LLMResponse(content="", model=model_alias, success=False, error=f"Quota exceeded, no fallback: {e}")
 
             except Exception as e:
@@ -205,6 +197,87 @@ class LLMClient:
                 time.sleep(self.config["defaults"]["retry_delay"] * (2 ** attempt))
 
         return LLMResponse(content="", model=model_alias, success=False, error="Max retries exceeded")
+
+    def _do_query(self, model_alias: str, prompt: str, context: Optional[str] = None, _is_fallback: bool = False) -> LLMResponse:
+        if model_alias not in self.config["models"]:
+            return LLMResponse(content="", model=model_alias, success=False, error=f"Unknown model alias: {model_alias}")
+
+        model_config = self.config["models"][model_alias]
+        provider = model_config["provider"]
+        if provider not in ("deepseek", "anthropic", "openai", "google", "gemini"):
+            return LLMResponse(content="", model=model_alias, success=False, error=f"Unsupported provider: {provider}")
+
+        full_prompt = prompt
+        if context:
+            full_prompt = f"Context:\n{context}\n\nTask:\n{prompt}"
+
+        def attempt() -> LLMResponse:
+            if provider == "deepseek":
+                return self._query_deepseek(model_config, full_prompt)
+            elif provider == "anthropic":
+                return self._query_anthropic(model_config, full_prompt)
+            elif provider == "openai":
+                return self._query_openai(model_config, full_prompt)
+            else:
+                return self._query_google(model_config, full_prompt)
+
+        return self._run_with_retries(
+            model_alias, attempt, _is_fallback,
+            on_fallback=lambda fb: self._do_query(fb, prompt, context, _is_fallback=True),
+        )
+
+    def query_chat(
+        self,
+        model_alias: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
+    ) -> LLMResponse:
+        """Multi-turn chat with optional tool-calling. Same timing/logging/cost tracking as query().
+
+        Currently implemented for the deepseek provider only; other providers return an
+        unsuccessful LLMResponse with an explanatory error.
+        """
+        t0 = time.time()
+        response = self._do_query_chat(model_alias, messages, tools, tool_choice)
+        latency_ms = int((time.time() - t0) * 1000)
+
+        if response.success:
+            _logger.info(
+                "llm/%s chat ok — %d in + %d out tokens, $%.6f, %dms%s",
+                model_alias, response.input_tokens or 0, response.output_tokens or 0,
+                response.cost or 0.0, latency_ms,
+                " (tool_calls)" if response.tool_calls else "",
+            )
+            self._append_cost_log(model_alias, response, latency_ms)
+        else:
+            _logger.error("llm/%s chat failed — %s", model_alias, response.error)
+
+        return response
+
+    def _do_query_chat(
+        self,
+        model_alias: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: str,
+        _is_fallback: bool = False,
+    ) -> LLMResponse:
+        if model_alias not in self.config["models"]:
+            return LLMResponse(content="", model=model_alias, success=False, error=f"Unknown model alias: {model_alias}")
+
+        model_config = self.config["models"][model_alias]
+        provider = model_config["provider"]
+        if provider != "deepseek":
+            return LLMResponse(content="", model=model_alias, success=False, error=f"query_chat not yet supported for provider: {provider}")
+
+        def attempt() -> LLMResponse:
+            return self._query_deepseek_chat(model_config, messages, tools, tool_choice)
+
+        return self._run_with_retries(
+            model_alias, attempt, _is_fallback,
+            on_fallback=lambda fb: self._do_query_chat(fb, messages, tools, tool_choice, _is_fallback=True),
+        )
 
     def _query_deepseek(self, model_config: Dict, prompt: str) -> LLMResponse:
         api_key = os.getenv(model_config["api_key_env"])
@@ -238,6 +311,52 @@ class LLMClient:
             total_tokens=usage.get("total_tokens", input_tokens + output_tokens),
             cost=self._calculate_cost(input_tokens, output_tokens, model_config["pricing"]),
             success=True,
+        )
+
+    def _query_deepseek_chat(
+        self,
+        model_config: Dict,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        tool_choice: str,
+    ) -> LLMResponse:
+        api_key = os.getenv(model_config["api_key_env"])
+        if not api_key:
+            raise ValueError(f"API key not found: {model_config['api_key_env']}")
+
+        payload: Dict[str, Any] = {
+            "model": model_config["model_name"],
+            "messages": messages,
+            "max_tokens": model_config["max_tokens"],
+            "temperature": model_config["temperature"],
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
+
+        resp = self.session.post(
+            f"{model_config['base_url']}/chat/completions",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            timeout=self.config["defaults"]["timeout"],
+        )
+        if resp.status_code != 200:
+            raise Exception(f"API error: {resp.status_code} - {resp.text}")
+
+        data = resp.json()
+        usage = data.get("usage", {})
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        message = data["choices"][0]["message"]
+        return LLMResponse(
+            content=message.get("content") or "",
+            model=model_config["model_name"],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=usage.get("total_tokens", input_tokens + output_tokens),
+            cost=self._calculate_cost(input_tokens, output_tokens, model_config["pricing"]),
+            success=True,
+            tool_calls=message.get("tool_calls"),
         )
 
     def _query_openai(self, model_config: Dict, prompt: str) -> LLMResponse:

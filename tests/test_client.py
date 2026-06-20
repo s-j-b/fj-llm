@@ -89,6 +89,16 @@ def deepseek_response(content="hello", in_tok=10, out_tok=5):
     return openai_response(content, in_tok, out_tok)
 
 
+def deepseek_tool_call_response(tool_calls, in_tok=10, out_tok=5):
+    mock = MagicMock()
+    mock.status_code = 200
+    mock.json.return_value = {
+        "choices": [{"message": {"content": None, "tool_calls": tool_calls}}],
+        "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok, "total_tokens": in_tok + out_tok},
+    }
+    return mock
+
+
 def google_response(content="hello", in_tok=10, out_tok=5):
     mock = MagicMock()
     mock.status_code = 200
@@ -260,3 +270,73 @@ class TestCostLog:
         record = json.loads(log_path.read_text().strip())
         assert record["alias"] == "test-openai"
         assert record["cost_usd"] > 0
+
+
+class TestQueryChat:
+    def test_content_only_response(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+        client = make_client()
+        messages = [{"role": "user", "content": "hello"}]
+        with patch.object(client.session, "post", return_value=deepseek_response("hi there", 12, 6)):
+            resp = client.query_chat("test-deepseek", messages)
+        assert resp.success
+        assert resp.content == "hi there"
+        assert resp.tool_calls is None
+        assert resp.input_tokens == 12
+
+    def test_tool_calls_populated(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+        client = make_client()
+        messages = [{"role": "user", "content": "what's the weather in NYC?"}]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        }]
+        tool_calls = [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "NYC"}'},
+        }]
+        mock_post = MagicMock(return_value=deepseek_tool_call_response(tool_calls))
+        with patch.object(client.session, "post", mock_post):
+            resp = client.query_chat("test-deepseek", messages, tools=tools, tool_choice="auto")
+        assert resp.success
+        assert resp.content == ""
+        assert resp.tool_calls == tool_calls
+        sent_payload = mock_post.call_args.kwargs["json"]
+        assert sent_payload["tools"] == tools
+        assert sent_payload["tool_choice"] == "auto"
+        assert sent_payload["messages"] == messages
+
+    def test_tool_choice_omitted_without_tools(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+        client = make_client()
+        messages = [{"role": "user", "content": "hello"}]
+        mock_post = MagicMock(return_value=deepseek_response("hi"))
+        with patch.object(client.session, "post", mock_post):
+            client.query_chat("test-deepseek", messages)
+        sent_payload = mock_post.call_args.kwargs["json"]
+        assert "tools" not in sent_payload
+        assert "tool_choice" not in sent_payload
+
+    def test_unsupported_provider_returns_error(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        client = make_client()
+        resp = client.query_chat("test-openai", [{"role": "user", "content": "hi"}])
+        assert not resp.success
+        assert "not yet supported" in resp.error
+
+    def test_unknown_model_returns_error(self):
+        client = make_client()
+        resp = client.query_chat("nonexistent", [{"role": "user", "content": "hi"}])
+        assert not resp.success
+        assert "Unknown model alias" in resp.error
+
+    def test_missing_api_key(self, monkeypatch):
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        client = make_client()
+        resp = client.query_chat("test-deepseek", [{"role": "user", "content": "hi"}])
+        assert not resp.success
