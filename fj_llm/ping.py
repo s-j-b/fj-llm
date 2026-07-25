@@ -44,7 +44,7 @@ _PING_CONFIGS = {
         "models": {
             "ping": {
                 "provider": "deepseek",
-                "model_name": "deepseek-chat",
+                "model_name": "deepseek-v4-flash",
                 "api_key_env": "DEEPSEEK_API_KEY",
                 "base_url": "https://api.deepseek.com/v1",
                 "max_tokens": 10,

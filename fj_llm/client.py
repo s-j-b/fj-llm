@@ -83,7 +83,7 @@ class LLMClient:
             "models": {
                 "deepseek-light": {
                     "provider": "deepseek",
-                    "model_name": "deepseek-chat",
+                    "model_name": "deepseek-v4-flash",
                     "api_key_env": "DEEPSEEK_API_KEY",
                     "base_url": "https://api.deepseek.com/v1",
                     "max_tokens": 4000,
@@ -95,14 +95,14 @@ class LLMClient:
                 },
                 "deepseek-reasoner": {
                     "provider": "deepseek",
-                    "model_name": "deepseek-reasoner",
+                    "model_name": "deepseek-v4-pro",
                     "api_key_env": "DEEPSEEK_API_KEY",
                     "base_url": "https://api.deepseek.com/v1",
                     "max_tokens": 8000,
                     "temperature": 0.0,
                     "pricing": {
-                        "input_per_1m_tokens": 55.0,
-                        "output_per_1m_tokens": 55.0,
+                        "input_per_1m_tokens": 0.435,
+                        "output_per_1m_tokens": 0.87,
                     },
                 },
                 "claude-sonnet": {
