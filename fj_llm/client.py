@@ -40,12 +40,23 @@ class LLMResponse:
 
 
 class LLMClient:
-    def __init__(self, config_path: str = "~/.config/fj_llm/config.yaml", config_dict: Optional[Dict] = None):
+    def __init__(
+        self,
+        config_path: str = "~/.config/fj_llm/config.yaml",
+        config_dict: Optional[Dict] = None,
+        on_cost_log: Optional[Callable[[str, "LLMResponse", int], None]] = None,
+    ):
         """
         Initialize LLM Client with flexible config loading.
         Priority: config_dict → FJ_LLM_CONFIG env var → config file
+
+        on_cost_log: optional callback invoked (alias, response, latency_ms) after
+        every successful query, in addition to the local JSONL cost log. Also
+        settable post-construction (client.on_cost_log = fn). A raising callback
+        is swallowed — it must never break the caller.
         """
         self.session = requests.Session()
+        self.on_cost_log = on_cost_log
 
         if config_dict:
             self.config = config_dict
@@ -143,11 +154,19 @@ class LLMClient:
                 model_alias, response.input_tokens or 0, response.output_tokens or 0,
                 response.cost or 0.0, latency_ms,
             )
-            self._append_cost_log(model_alias, response, latency_ms)
+            self._notify_cost_log(model_alias, response, latency_ms)
         else:
             _logger.error("llm/%s failed — %s", model_alias, response.error)
 
         return response
+
+    def _notify_cost_log(self, alias: str, response: "LLMResponse", latency_ms: int) -> None:
+        self._append_cost_log(alias, response, latency_ms)
+        if self.on_cost_log is not None:
+            try:
+                self.on_cost_log(alias, response, latency_ms)
+            except Exception as e:
+                _logger.warning("on_cost_log callback failed: %s", e)
 
     def _append_cost_log(self, alias: str, response: "LLMResponse", latency_ms: int) -> None:
         try:
@@ -249,7 +268,7 @@ class LLMClient:
                 response.cost or 0.0, latency_ms,
                 " (tool_calls)" if response.tool_calls else "",
             )
-            self._append_cost_log(model_alias, response, latency_ms)
+            self._notify_cost_log(model_alias, response, latency_ms)
         else:
             _logger.error("llm/%s chat failed — %s", model_alias, response.error)
 

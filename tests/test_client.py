@@ -272,6 +272,69 @@ class TestCostLog:
         assert record["cost_usd"] > 0
 
 
+class TestOnCostLogCallback:
+    def test_callback_fires_on_success(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        calls = []
+        client = LLMClient(config_dict=MINIMAL_CONFIG, on_cost_log=lambda *args: calls.append(args))
+        with patch.object(client.session, "post", return_value=openai_response("world", 20, 10)):
+            resp = client.query("test-openai", "hello")
+        assert len(calls) == 1
+        alias, response, latency_ms = calls[0]
+        assert alias == "test-openai"
+        assert response is resp
+        assert isinstance(latency_ms, int)
+
+    def test_callback_settable_post_construction(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        calls = []
+        client = make_client()
+        client.on_cost_log = lambda *args: calls.append(args)
+        with patch.object(client.session, "post", return_value=openai_response()):
+            client.query("test-openai", "hello")
+        assert len(calls) == 1
+
+    def test_callback_not_fired_on_failure(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        calls = []
+        client = LLMClient(config_dict=MINIMAL_CONFIG, on_cost_log=lambda *args: calls.append(args))
+        resp = client.query("test-openai", "hello")
+        assert not resp.success
+        assert calls == []
+
+    def test_raising_callback_does_not_break_query(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        def bad_callback(*args):
+            raise RuntimeError("boom")
+
+        client = LLMClient(config_dict=MINIMAL_CONFIG, on_cost_log=bad_callback)
+        with patch.object(client.session, "post", return_value=openai_response()):
+            resp = client.query("test-openai", "hello")
+        assert resp.success
+
+    def test_callback_fires_on_query_chat_success(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+        calls = []
+        client = LLMClient(config_dict=MINIMAL_CONFIG, on_cost_log=lambda *args: calls.append(args))
+        messages = [{"role": "user", "content": "hello"}]
+        with patch.object(client.session, "post", return_value=deepseek_response("hi", 12, 6)):
+            client.query_chat("test-deepseek", messages)
+        assert len(calls) == 1
+        assert calls[0][0] == "test-deepseek"
+
+    def test_default_cost_log_still_written_alongside_callback(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        log_path = tmp_path / "costs.jsonl"
+        monkeypatch.setenv("FJ_LLM_COST_LOG", str(log_path))
+        calls = []
+        client = LLMClient(config_dict=MINIMAL_CONFIG, on_cost_log=lambda *args: calls.append(args))
+        with patch.object(client.session, "post", return_value=openai_response()):
+            client.query("test-openai", "hello")
+        assert log_path.exists()
+        assert len(calls) == 1
+
+
 class TestQueryChat:
     def test_content_only_response(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
