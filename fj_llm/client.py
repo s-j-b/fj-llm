@@ -37,6 +37,7 @@ class LLMResponse:
     success: bool = True
     error: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    used_fallback: bool = False
 
 
 class LLMClient:
@@ -128,6 +129,26 @@ class LLMClient:
                         "output_per_1m_tokens": 15.0,
                     },
                 },
+                # Self-hosted, OpenAI-compatible endpoint (llama.cpp/vLLM behind
+                # a Cloudflare Tunnel today; the "openai_compatible" provider
+                # also covers pointing this same alias at a real cloud API like
+                # OpenAI or Moonshot/Kimi later, no query_chat code change needed).
+                # base_url/model_name are env-overridable so swapping which model
+                # answers behind the tunnel doesn't require touching this file --
+                # only switching to a genuinely different provider/host does.
+                "bluejay-local": {
+                    "provider": "openai_compatible",
+                    "model_name": os.getenv("BLUEJAY_LOCAL_MODEL_NAME", "gemma-4-12b"),
+                    "api_key_env": "JUPEMODEL_API_KEY",
+                    "base_url": os.getenv("BLUEJAY_LOCAL_BASE_URL", "https://model-a.sjb.nyc/v1"),
+                    "max_tokens": 4000,
+                    "temperature": 0.1,
+                    "pricing": {
+                        "input_per_1m_tokens": 0.0,
+                        "output_per_1m_tokens": 0.0,
+                    },
+                    "fallback": "deepseek-light",
+                },
             },
             "defaults": {
                 "retry_attempts": 3,
@@ -193,9 +214,17 @@ class LLMClient:
         on_fallback: Callable[[str], LLMResponse],
     ) -> LLMResponse:
         """Shared retry/fallback loop for query() and query_chat(). attempt_fn() runs one
-        provider call and may raise QuotaExceededError (triggers fallback) or any other
-        Exception (triggers retry)."""
+        provider call and may raise QuotaExceededError (triggers fallback immediately,
+        no point retrying a quota error) or any other Exception (retries with backoff;
+        if a fallback is configured, exhausting all retries falls back too instead of
+        hard-failing -- covers a self-hosted endpoint being unreachable/timed out, not
+        just quota errors)."""
         model_config = self.config["models"][model_alias]
+
+        def _tag_fallback(response: LLMResponse) -> LLMResponse:
+            if response.success:
+                response.used_fallback = True
+            return response
 
         for attempt in range(self.config["defaults"]["retry_attempts"]):
             try:
@@ -207,11 +236,18 @@ class LLMClient:
                 fallback = model_config.get("fallback")
                 if fallback and not _is_fallback:
                     _logger.warning("llm/%s quota exceeded, falling back to %s", model_alias, fallback)
-                    return on_fallback(fallback)
+                    return _tag_fallback(on_fallback(fallback))
                 return LLMResponse(content="", model=model_alias, success=False, error=f"Quota exceeded, no fallback: {e}")
 
             except Exception as e:
                 if attempt == self.config["defaults"]["retry_attempts"] - 1:
+                    fallback = model_config.get("fallback")
+                    if fallback and not _is_fallback:
+                        _logger.warning(
+                            "llm/%s failed after %d attempts (%s), falling back to %s",
+                            model_alias, attempt + 1, e, fallback,
+                        )
+                        return _tag_fallback(on_fallback(fallback))
                     return LLMResponse(content="", model=model_alias, success=False, error=f"Failed after {attempt + 1} attempts: {e}")
                 time.sleep(self.config["defaults"]["retry_delay"] * (2 ** attempt))
 
@@ -254,7 +290,9 @@ class LLMClient:
     ) -> LLMResponse:
         """Multi-turn chat with optional tool-calling. Same timing/logging/cost tracking as query().
 
-        Currently implemented for the deepseek provider only; other providers return an
+        Implemented for the deepseek provider and any "openai_compatible" provider
+        (self-hosted llama.cpp/vLLM, or a real OpenAI-shaped cloud API) -- both speak
+        the same bearer-token + /chat/completions shape. Other providers return an
         unsuccessful LLMResponse with an explanatory error.
         """
         t0 = time.time()
@@ -287,11 +325,11 @@ class LLMClient:
 
         model_config = self.config["models"][model_alias]
         provider = model_config["provider"]
-        if provider != "deepseek":
+        if provider not in ("deepseek", "openai_compatible"):
             return LLMResponse(content="", model=model_alias, success=False, error=f"query_chat not yet supported for provider: {provider}")
 
         def attempt() -> LLMResponse:
-            return self._query_deepseek_chat(model_config, messages, tools, tool_choice)
+            return self._query_openai_compatible_chat(model_config, messages, tools, tool_choice)
 
         return self._run_with_retries(
             model_alias, attempt, _is_fallback,
@@ -332,13 +370,17 @@ class LLMClient:
             success=True,
         )
 
-    def _query_deepseek_chat(
+    def _query_openai_compatible_chat(
         self,
         model_config: Dict,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         tool_choice: str,
     ) -> LLMResponse:
+        """Shared chat implementation for both "deepseek" and "openai_compatible"
+        providers -- deepseek's real API and any self-hosted/OpenAI-shaped
+        endpoint speak the identical bearer-token + /chat/completions request
+        shape, so this was never actually deepseek-specific."""
         api_key = os.getenv(model_config["api_key_env"])
         if not api_key:
             raise ValueError(f"API key not found: {model_config['api_key_env']}")
