@@ -469,19 +469,31 @@ class LLMClient:
         if not api_key:
             raise ValueError(f"API key not found: {model_config['api_key_env']}")
 
+        payload = {
+            "model": model_config["model_name"],
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": model_config["max_tokens"],
+        }
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        # Newer Claude models (Opus 5.5 and up) reject sampling params with a
+        # 400, so an alias for one simply leaves `temperature` out of its config.
+        if "temperature" in model_config:
+            payload["temperature"] = model_config["temperature"]
+        # Thinking depth on adaptive-thinking models: low|medium|high|xhigh|max.
+        if model_config.get("effort"):
+            payload["output_config"] = {"effort": model_config["effort"]}
+        # Server-side refusal fallback (`fallbacks: default` in the alias config).
+        if model_config.get("fallbacks"):
+            payload["fallbacks"] = model_config["fallbacks"]
+            headers["anthropic-beta"] = "server-side-fallback-2026-07-01"
         resp = self.session.post(
             f"{model_config['base_url']}/messages",
-            json={
-                "model": model_config["model_name"],
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": model_config["max_tokens"],
-                "temperature": model_config["temperature"],
-            },
-            headers={
-                "x-api-key": api_key,
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01",
-            },
+            json=payload,
+            headers=headers,
             timeout=self.config["defaults"]["timeout"],
         )
         if resp.status_code != 200:
@@ -495,11 +507,18 @@ class LLMClient:
             raise Exception(f"API error: {resp.status_code} - {resp.text}")
 
         data = resp.json()
+        if data.get("stop_reason") == "refusal":
+            details = data.get("stop_details") or {}
+            raise Exception(f"Anthropic refusal ({details.get('category')}): {details.get('explanation', '')}")
+        # Thinking models put thinking (and fallback) blocks before the answer,
+        # so join the text blocks rather than reading content[0].
+        text = "".join(b.get("text", "") for b in data.get("content", [])
+                       if b.get("type", "text") == "text")
         usage = data.get("usage", {})
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
         return LLMResponse(
-            content=data["content"][0]["text"],
+            content=text,
             model=model_config["model_name"],
             input_tokens=input_tokens,
             output_tokens=output_tokens,

@@ -205,6 +205,42 @@ class TestAnthropicProvider:
         assert "Quota exceeded" in resp.error
 
 
+    def test_thinking_model_payload_and_text_blocks(self, monkeypatch):
+        """Opus-5.5-style alias: no temperature sent, effort + fallbacks passed,
+        answer read from the text block after a thinking block."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        client = make_client()
+        cfg = client.config["models"]["test-anthropic"]
+        cfg.pop("temperature")
+        cfg.update(effort="high", fallbacks="default")
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.json.return_value = {
+            "content": [{"type": "thinking", "thinking": ""}, {"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 4},
+        }
+        with patch.object(client.session, "post", return_value=mock) as post:
+            resp = client.query("test-anthropic", "hello")
+        assert resp.success and resp.content == "answer"
+        sent = post.call_args.kwargs
+        assert "temperature" not in sent["json"]
+        assert sent["json"]["output_config"] == {"effort": "high"}
+        assert sent["json"]["fallbacks"] == "default"
+        assert sent["headers"]["anthropic-beta"] == "server-side-fallback-2026-07-01"
+
+    def test_refusal_is_a_failure(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        client = make_client()
+        mock = MagicMock()
+        mock.status_code = 200
+        mock.json.return_value = {"content": [], "stop_reason": "refusal",
+                                  "stop_details": {"category": "cyber", "explanation": "x"},
+                                  "usage": {"input_tokens": 1, "output_tokens": 0}}
+        with patch.object(client.session, "post", return_value=mock):
+            resp = client.query("test-anthropic", "hello")
+        assert not resp.success and "refusal" in resp.error
+
+
 class TestDeepSeekProvider:
     def test_successful_query(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
